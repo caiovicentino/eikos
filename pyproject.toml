@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eikos"
+version = "0.1.0"
+description = "Eikos: open, calibrated, single-pass typed-decision models (inference, training and evaluation code)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Caio Vicentino"}]
+dependencies = ["torch>=2.12", "transformers>=5.12", "safetensors", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/caiovicentino/eikos"
+Models = "https://huggingface.co/caiovicentino1"
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.30.0", "packaging"]
+mlx = ["mlx>=0.32", "mlx-lm>=0.31"]
+train = ["peft>=0.21", "datasets", "flash-linear-attention>=0.5.2", "accelerate"]
+quant = ["llmcompressor>=0.14", "datasets"]
+
+[tool.setuptools]
+package-dir = {"" = "eikos"}
+py-modules = ["decision_core", "letter_adapter", "mlx_decide", "local_demo_cases"]

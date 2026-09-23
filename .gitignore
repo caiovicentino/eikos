@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+runs/
+ckpt/
+models/
+data/
+snap_*/
+suite*.jsonl
+*.log
+*.pid
+.venv*/
+.DS_Store
+._*
