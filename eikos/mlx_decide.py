@@ -2,7 +2,8 @@
 PyTorch backend (letter_adapter), with no LoRA, no API and no internet. The common prefix (system + state) goes
 through the model once; the hybrid cache (attention KV + Gated DeltaNet states) is replicated and the N questions run
 together in one right-padded batch (real positions never see the padding: causal attention and the recurrence only
-look back).
+look back). Questions with more than 26 options use the same multi-round tournament as the GPU backends
+(decision_core.tournament).
 usage: python mlx_decide.py <model_dir>        (demo; compares against PyTorch if COMPARE_TORCH=1)"""
 import copy
 import json
@@ -22,8 +23,8 @@ class MLXDecider:
     def __init__(self, path):
         cfg = json.load(open(os.path.join(path, "decision_config.json")))
         os.environ["PROMPT_STYLE"] = cfg["prompt_version"].rsplit("-", 1)[-1]
-        global LETTERS, messages, options_of, temp_for
-        from decision_core import LETTERS, messages, options_of, temp_for  # noqa: F401  (after PROMPT_STYLE is set)
+        global LETTERS, messages, options_of, temp_for, tournament
+        from decision_core import LETTERS, messages, options_of, temp_for, tournament  # noqa: F401  (after PROMPT_STYLE is set)
         cp = os.path.join(path, cfg.get("calib") or "calib.json")
         self.calib = json.load(open(cp)) if os.path.exists(cp) else None
         self.model, self.tok = mlx_load(path)
@@ -56,6 +57,8 @@ class MLXDecider:
         return {lab: p[i] for i, (lab, _) in enumerate(opts)}
 
     def dist(self, state, q, opts):
+        if len(opts) > 26:  # only 26 letters: blocks of 20, the top 2 of each block go to a final round
+            return tournament(lambda o: self.dist(state, q, o), opts)
         ids = self._ids(state, q, opts)
         cache = self.lm.make_cache()
         h = self.inner(mx.array([ids]), cache)[:, -1, :]
@@ -74,7 +77,12 @@ class MLXDecider:
         return cache
 
     def dist_many_cached(self, state, items, chunk=32):
-        """Several questions about the same state: the prefix once, then the questions in a batch from the cache."""
+        """Several questions about the same state: the prefix once, then the questions in a batch from the cache.
+        Questions with more than 26 options go through dist (tournament), one at a time."""
+        if any(len(o) > 26 for _, o in items):
+            small = [(q, o) for q, o in items if len(o) <= 26]
+            done = iter(self.dist_many_cached(state, small, chunk) if small else [])
+            return [self.dist(state, q, o) if len(o) > 26 else next(done) for q, o in items]
         seqs = [self._ids(state, q, o) for q, o in items]
         P = 0
         while all(len(x) > P + 1 for x in seqs) and len({x[P] for x in seqs}) == 1:

@@ -1,7 +1,9 @@
 """Evaluates an MLX build (8-bit, 4-bit...) on a suite_*.jsonl evaluation suite, in the same per-item format as
 eval_vllm_suite (id, task, pred, gold, ok, conf), to compare quantizations item by item against bf16.
 Runs on a Mac (Metal) or on a Linux GPU server (in an MLX environment with CUDA).
-usage: python eval_mlx_suite.py <mlx_dir> <suite.jsonl> <tag>"""
+Questions with more than 26 options use the same tournament as eval_vllm_suite (decision_core.tournament).
+usage: [MLX_ITEMS=all|big|small] python eval_mlx_suite.py <mlx_dir> <suite.jsonl> <tag>
+       (big = only the questions with more than 26 options; small = only the others; default all)"""
 import collections
 import json
 import sys
@@ -16,7 +18,10 @@ EIKOS_RUNS = os.environ.get("EIKOS_RUNS", "runs")  # evaluation outputs
 M, SUITE, TAG = sys.argv[1:4]
 mx.set_cache_limit(4 * 1024 ** 3)  # without a limit, the MLX (CUDA) cache grows until it fills the whole GPU
 d = MLXDecider(M)
-from decision_core import options_of  # noqa: E402  (after MLXDecider sets PROMPT_STYLE)
+from decision_core import options_of, tournament  # noqa: E402  (after MLXDecider sets PROMPT_STYLE)
+
+ITEMS = os.environ.get("MLX_ITEMS", "all")
+assert ITEMS in ("all", "big", "small"), ITEMS
 
 BUCKET = 128
 
@@ -41,16 +46,20 @@ t0 = time.time()
 with open(f"{EIKOS_RUNS}/suite_{TAG}.jsonl", "w") as fo:
     for r in rows:
         o = options_of(r["question"], list(r["labels"]))
-        if len(o) > 26:
+        big = len(o) > 26
+        if (ITEMS == "big" and not big) or (ITEMS == "small" and big):
             continue
-        p, n = dist_bucketed(r["state"], r["question"], o)
+        if big:  # blocks of 20, the top 2 of each block go to the final round (<=26), as in eval_vllm_suite
+            p, n = tournament(lambda oo, r=r: dist_bucketed(r["state"], r["question"], oo), o)
+        else:
+            p, n = dist_bucketed(r["state"], r["question"], o)
         if n > 4000:
             mx.clear_cache()
         pred = max(p, key=p.get)
         ok = pred == str(r["expected"])
         per[r["task"]].append(ok)
         fo.write(json.dumps({"id": r["id"], "task": r["task"], "pred": pred, "gold": r["expected"], "ok": ok,
-                             "conf": p[pred], "n_tok": n}) + "\n")
+                             "conf": p[pred], "n_tok": n, "tournament": big}) + "\n")
 summ = {t: {"acc": round(sum(v) / len(v), 4), "n": len(v)} for t, v in sorted(per.items())}
 summ["_macro"] = round(sum(x["acc"] for x in summ.values()) / len(summ), 4)
 summ["_tag"] = TAG
