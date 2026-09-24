@@ -1,5 +1,7 @@
 # Eikos
 
+![Eikos overview: JevBench hard accuracy, error when at least 90% confident and long context, against Jev and Laya](assets/eikos_launch.png)
+
 **Eikos** (εἰκός, *"the probable"*) is a family of open typed-decision models, released under MIT. Each model:
 - answers a structured question about a given state in **one forward pass**;
 - returns a **calibrated probability for every option**, so a caller can act on confident decisions and escalate
@@ -24,6 +26,8 @@ This repository contains everything used to build the models:
 | JevBench public, hard tier | **82.9** | 72.1 | 73.0 | 35.1 |
 | Error when ≥90% confident (7,140 items, 6 suites) | **2.4%** | **2.4%** | 5.9% | 37.3% |
 | Accuracy with the decision hidden in 64k tokens (mean of 3 positions) | **88.3** | 74.2 | — (API limit 32k) | — (512–1k context) |
+
+![Confidence you can act on: error among the decisions each system takes on its own as its confidence threshold drops](assets/chart_confidence.png)
 
 The model cards have the full tables, the per-build validation (bf16, FP8, INT4, MLX) and the limitations.
 
