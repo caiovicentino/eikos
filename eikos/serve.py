@@ -29,16 +29,21 @@ from threading import Lock
 
 class Decider:
     def __init__(self, a):
-        from letter_adapter import LetterAdapter
-        common = dict(device=a.device, adapter_path=a.adapter, temp=a.temp, calib=a.calib, max_tokens=a.max_tokens)
-        src = (f"vllm:{a.vllm_url}|{a.model}" if a.vllm_url else
-               f"sglang:{a.sglang_url}|{a.model}" if a.sglang_url else a.model)
         self.remote = bool(a.vllm_url or a.sglang_url)
-        self.fast = LetterAdapter(src, **common)
-        self.fast.load()
-        self.verify = LetterAdapter(src, verify_budget=a.verify_budget, **common) if a.verify_budget else None
-        if self.verify:
-            self.verify._loaded = self.fast._loaded  # same weights
+        if a.device == "mlx":  # Apple Silicon: mlx_decide.MLXDecider has the same dist interface
+            from mlx_decide import MLXDecider
+            self.fast = MLXDecider(a.model)
+            self.verify = None
+        else:
+            from letter_adapter import LetterAdapter
+            common = dict(device=a.device, adapter_path=a.adapter, temp=a.temp, calib=a.calib, max_tokens=a.max_tokens)
+            src = (f"vllm:{a.vllm_url}|{a.model}" if a.vllm_url else
+                   f"sglang:{a.sglang_url}|{a.model}" if a.sglang_url else a.model)
+            self.fast = LetterAdapter(src, **common)
+            self.fast.load()
+            self.verify = LetterAdapter(src, verify_budget=a.verify_budget, **common) if a.verify_budget else None
+            if self.verify:
+                self.verify._loaded = self.fast._loaded  # same weights
         self.sym = a.sym
         # Local PyTorch: one pass at a time on the GPU. vLLM/SGLang: no lock (the server batches concurrent requests).
         self.lock = Lock() if not self.remote else contextlib.nullcontext()

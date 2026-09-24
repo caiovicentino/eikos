@@ -108,6 +108,16 @@ class MLXDecider:
                 out.append((self._probs(lg[i], len(part[i]), o, q), len(part[i])))
         return out
 
+    # ---- parity shims so serve.py's Decider can drive the MLX backend like letter_adapter ----
+    def load(self):
+        return self.model, self.tok, self.let_idx
+
+    def dist_many(self, state, items):
+        return self.dist_many_cached(state, items)
+
+    def dist_any(self, state, question, opts, **kw):
+        return self.dist(state, question, opts)
+
 
 def _demo(M):
     t0 = time.perf_counter()
