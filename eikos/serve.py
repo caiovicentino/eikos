@@ -115,6 +115,8 @@ class Decider:
 
 def make_handler(dec: Decider):
     class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keep-alive: clients reuse the connection (every response sets Content-Length)
+
         def log_message(self, *a):
             pass
 
