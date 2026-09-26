@@ -20,6 +20,8 @@ This repository contains everything used to build the models:
 
 - Models: `caiovicentino1/Eikos-4B`, `caiovicentino1/Eikos-27B` (with `-FP8`, `-INT4` and `-MLX` builds).
 - Data: `caiovicentino1/eikos-decisions`, the exact training data with per-row attribution.
+- Live demo: [Eikos-4B on Hugging Face Spaces](https://huggingface.co/spaces/caiovicentino1/eikos-4b-typed-decisions-demo)
+  (ZeroGPU; all three question types, up to 100 options in one pass).
 
 | Headline (our harness, same items for every system) | Eikos-27B | Eikos-4B | Jev | Laya |
 |---|---|---|---|---|
