@@ -1,5 +1,27 @@
 # Changelog
 
+## serve v1.2.1 (2026-09-26)
+
+**`serve_vllm.sh` now sets `--max-num-seqs 64`** (change it with the `MAX_NUM_SEQS` environment variable). Without
+it, vLLM 0.30 uses its default of 1024 on large GPUs, and every request in flight needs one block of the hybrid
+(Mamba) cache. With the script's default memory setting (0.85), one RTX PRO 6000 (96 GB) has 530 such blocks for
+Eikos-27B and 1,003 for Eikos-27B-FP8, so the server refused to start ("max_num_seqs (1024) exceeds available Mamba
+cache blocks"). The 27B-INT4 and the 4B builds started, with less room on smaller GPUs.
+
+Launched with the published script and with the fixed one on one RTX PRO 6000 (vLLM 0.30), each followed by a test
+request:
+
+| build | v1.2 script | v1.2.1 script |
+|---|---|---|
+| Eikos-27B | does not start (530 blocks) | starts |
+| Eikos-27B-FP8 | does not start (1,003 blocks) | starts |
+| Eikos-27B-INT4 | starts | starts |
+| Eikos-4B | starts | starts |
+| Eikos-4B-FP8, Eikos-4B-INT4 | not run | start |
+
+The flag only caps how many requests are processed at once; prompts and the readout are unchanged. Our own servers
+have run with 64 since launch.
+
 ## serve v1.2 (2026-09-26)
 
 ### What changes

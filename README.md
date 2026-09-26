@@ -68,7 +68,8 @@ python eikos/serve.py --model <MODEL_DIR> --vllm-url http://127.0.0.1:8001 --por
 > **vLLM ≥ 0.30.0 is required.** On this hybrid (Gated DeltaNet) architecture, older builds return wrong answers
 > when several long requests are batched together. We measured drops of 3–6 points on long, shared-document items
 > with vLLM 0.11. With 0.30, batched results match the PyTorch reference. `serve_vllm.sh` refuses to start on older
-> versions.
+> versions. It also sets `--max-num-seqs 64` (change it with `MAX_NUM_SEQS`): with vLLM's default of 1024, a 27B
+> build does not start on one 80–96 GB GPU.
 
 ```bash
 curl -s localhost:8000/v1/systemone -d '{
