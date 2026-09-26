@@ -2,7 +2,8 @@
 letter readout (processed logprobs over the letters only), the model's calibration T, prefix cache (long rules that
 are identical across items come almost for free). Reports accuracy and balanced accuracy per task.
 usage: python eval_vllm_suite.py <model> <suite.jsonl|ALL> <tag> <gpu_frac> [max_len]
-       ALL = the 7 suites (tags <tag>_<suite>), loading the model only once. >26 options: tournament."""
+       ALL = the 7 suites (tags <tag>_<suite>), loading the model only once. Up to 588 options (labels A..Z, AA, AB,
+       ...) in one pass, more via a tournament. TOURNAMENT_26=1 reproduces v1.0/v1.1 (tournament above 26 options)."""
 import collections
 import json
 import math
@@ -15,8 +16,12 @@ os.environ.setdefault("PROMPT_STYLE", "semif")
 
 def main():
     from vllm import LLM, SamplingParams
-    from decision_core import LETTERS, messages, options_of, temp_for
+    from decision_core import LABELS, messages, options_of, temp_for
     M, suite, tag, frac = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+    cfg = json.load(open(f"{M}/decision_config.json")) if os.path.exists(f"{M}/decision_config.json") else {}
+    # most options read in one pass: the model's setting (MAX_ONE_PASS overrides it); TOURNAMENT_26=1 = v1.0/v1.1
+    one = 26 if os.environ.get("TOURNAMENT_26") == "1" else \
+        min(int(os.environ.get("MAX_ONE_PASS") or cfg.get("max_one_pass") or len(LABELS)), len(LABELS))
     max_len = int(sys.argv[5]) if len(sys.argv) > 5 else 40960
     calib = json.load(open(f"{M}/calib.json")) if os.path.exists(f"{M}/calib.json") else None
     extra = {"quantization": os.environ["QUANT"]} if os.environ.get("QUANT") else {}  # e.g. QUANT=fp8 (validation)
@@ -32,9 +37,10 @@ def main():
     if os.environ.get("NO_CHUNKED") == "1":
         extra["enable_chunked_prefill"] = False
     llm = LLM(model=M, dtype="bfloat16", gpu_memory_utilization=frac, max_model_len=max_len, logprobs_mode="processed_logprobs",
-              max_logprobs=32, max_num_seqs=int(os.environ.get("MAX_SEQS", "4")), **extra)
+              max_logprobs=600, max_num_seqs=int(os.environ.get("MAX_SEQS", "4")), **extra)
     tok = llm.get_tokenizer()
-    let = [tok.encode(L, add_special_tokens=False)[0] for L in LETTERS]
+    let = [tok.encode(L, add_special_tokens=False)[0] for L in LABELS]
+    assert all(len(tok.encode(L, add_special_tokens=False)) == 1 for L in LABELS) and len(set(let)) == len(let)
 
     def run(batch):
         """One vLLM pass over a batch of (item, options) → [(probs per label, n_tokens)], with the model's
@@ -80,16 +86,19 @@ def main():
         t = f"{tag}_{b}" if b else tag
         rows = [json.loads(line) for line in open(path)]
         items = [(r, options_of(r["question"], list(r["labels"]))) for r in rows]
-        small = [i for i, (_, o) in enumerate(items) if len(o) <= 26]
-        big = [i for i, (_, o) in enumerate(items) if len(o) > 26]
+        small = [i for i, (_, o) in enumerate(items) if len(o) <= one]
+        big = [i for i, (_, o) in enumerate(items) if len(o) > one]
         final = dict(zip(small, run([items[i] for i in small])))
-        if big:  # same tournament as decision_core.tournament: blocks of 20, top 2 per block advance to the final (≤26)
-            blocks = [(i, items[i][1][k:k + 20]) for i in big for k in range(0, len(items[i][1]), 20)]
+        if big:  # same tournament as decision_core.tournament: blocks, the best of each go to one final pass
+            chunk = 20 if one == 26 else one
+            keep = {i: 2 if one == 26 else max(1, min(chunk // 2, one // math.ceil(len(items[i][1]) / chunk)))
+                    for i in big}
+            blocks = [(i, items[i][1][k:k + chunk]) for i in big for k in range(0, len(items[i][1]), chunk)]
             fin, ntok = collections.defaultdict(list), collections.defaultdict(int)
             for (i, blk), (p, n) in zip(blocks, run([(items[i][0], blk) for i, blk in blocks])):
-                fin[i] += sorted(blk, key=lambda x: -p[x[0]])[:2]
+                fin[i] += sorted(blk, key=lambda x: -p[x[0]])[:keep[i]]
                 ntok[i] += n
-            for i, (pf, n) in zip(big, run([(items[i][0], fin[i][:26]) for i in big])):
+            for i, (pf, n) in zip(big, run([(items[i][0], fin[i][:one]) for i in big])):
                 probs = {lab: 1e-4 for lab, _ in items[i][1]}
                 probs.update(pf)
                 z = sum(probs.values())
@@ -102,7 +111,7 @@ def main():
                 ok = pred == str(r["expected"])
                 per[r["task"]].append((str(r["expected"]), pred, ok))
                 fo.write(json.dumps({"id": r["id"], "task": r["task"], "pred": pred, "gold": r["expected"], "ok": ok,
-                                     "conf": p[pred], "n_tok": n, "tournament": len(o) > 26}) + "\n")
+                                     "conf": p[pred], "n_tok": n, "tournament": len(o) > one}) + "\n")
         summ = {}
         for tk, v in sorted(per.items()):
             acc = sum(x[2] for x in v) / len(v)

@@ -1,7 +1,8 @@
 """Typed-decision server compatible with the TypeSafe API (POST /v1/systemone and /v1/evaluate).
 
 Uses the same core as training and evaluation (decision_core + letter_adapter): same prompt, same
-letter readout, same calibration. All questions in a request go in one pass (batch); >26 options via a tournament;
+letter readout, same calibration. All questions in a request go in one pass (batch), each with up to 588 options
+(labels A..Z, AA, AB, ...; start vLLM with serve_vllm.sh, --max-logprobs 600); more options than that via a tournament;
 System One: by default every question is answered in one pass, without generating text. Optional (off by
 default, not used for the reported results): "mode": "verify" per question turns on a short reasoning step before
 the letter (--verify-budget N).
@@ -26,6 +27,9 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
+
+VERSION = "1.2"
+
 
 class Decider:
     def __init__(self, a):
@@ -130,7 +134,7 @@ def make_handler(dec: Decider):
 
         def do_GET(self):
             if self.path in ("/health", "/v1/health"):
-                self._send(200, {"ok": True, "model": dec.name})
+                self._send(200, {"ok": True, "model": dec.name, "version": VERSION})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -211,18 +215,25 @@ def main():
     ap.add_argument("--sym", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=16000)
     ap.add_argument("--verify-budget", type=int, default=0, help="optional: enables 'mode': 'verify' (short reasoning)")
-    ap.add_argument("--vllm-url", default=None, help="production backend: vLLM URL (serve_vllm.sh)")
+    ap.add_argument("--vllm-url", default=None, help="production backend: vLLM URL (serve_vllm.sh); several "
+                    "comma-separated URLs (e.g. one server per GPU) spread the requests, least busy first")
     ap.add_argument("--sglang-url", default=None, help="production backend (parallel): URL of the SGLang server")
+    ap.add_argument("--max-one-pass", type=int, default=None,
+                    help="most options read in one pass (default: the model's decision_config.json, else 588)")
     a = ap.parse_args()
     cfg_path = os.path.join(a.model, "decision_config.json")
+    cfg = {}
     if os.path.exists(cfg_path):  # exported model: the configuration ships with the weights
         cfg = json.load(open(cfg_path))
         os.environ.setdefault("PROMPT_STYLE", cfg.get("prompt_version", "letter-v1-semif").rsplit("-", 1)[-1])
         if a.calib is None and cfg.get("calib"):
             a.calib = os.path.join(a.model, cfg["calib"])
+    import decision_core  # after PROMPT_STYLE is set
+    decision_core.set_max_one_pass(a.max_one_pass or cfg.get("max_one_pass"))
     dec = Decider(a)
     dec.decide("warm-up", {"type": "noul", "instructions": "Is this a warm-up?", "criteria": {"true": "yes", "false": "no"}})
-    print(f"ready at http://{a.host}:{a.port} (calib={bool(a.calib)}, sym={a.sym}, backend={'vllm' if a.vllm_url else 'sglang' if a.sglang_url else 'pytorch'}, verify={a.verify_budget})", flush=True)
+    print(f"serve.py {VERSION} ready at http://{a.host}:{a.port} (calib={bool(a.calib)}, sym={a.sym}, backend={'vllm' if a.vllm_url else 'sglang' if a.sglang_url else 'pytorch'}, verify={a.verify_budget}, one pass up to {decision_core.MAX_ONE_PASS} options)", flush=True)
+    ThreadingHTTPServer.request_queue_size = 1024  # the default (5) drops connections when many clients arrive at once
     ThreadingHTTPServer((a.host, a.port), make_handler(dec)).serve_forever()
 
 

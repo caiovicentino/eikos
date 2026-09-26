@@ -35,7 +35,7 @@ The model cards have the full tables, the per-build validation (bf16, FP8, INT4,
 
 | Folder | What it holds |
 |---|---|
-| `eikos/` | Inference library and server:<br>• `decision_core` (prompt, options, tournament for >26 options);<br>• `letter_adapter` (letter-logit readout; PyTorch, SGLang and vLLM backends; prefix cache);<br>• `serve.py` (HTTP API + agent sessions);<br>• `mlx_decide.py` (Apple Silicon). |
+| `eikos/` | Inference library and server:<br>• `decision_core` (prompt, option labels A–Z, AA, AB, …: up to 588 options in one pass, per-model limit in `decision_config.json`; tournament beyond);<br>• `letter_adapter` (letter-logit readout; PyTorch, SGLang and vLLM backends; prefix cache);<br>• `serve.py` (HTTP API + agent sessions);<br>• `mlx_decide.py` (Apple Silicon). |
 | `examples/` | Local demo and a game-loop latency benchmark |
 | `scripts/` | `serve_vllm.sh` (production serving), `train_final.sh` (exact final recipes), `build_eval_suites.sh` |
 | `data_pipeline/` | Item generation with blind teacher labeling (`gen_pipeline.py`), programmatic generators (`prog_*.py`), long-context dossiers, PT↔EN views, decontamination and the training snapshot |

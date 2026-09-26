@@ -1,7 +1,8 @@
 """Evaluates an MLX build (8-bit, 4-bit...) on a suite_*.jsonl evaluation suite, in the same per-item format as
 eval_vllm_suite (id, task, pred, gold, ok, conf), to compare quantizations item by item against bf16.
 Runs on a Mac (Metal) or on a Linux GPU server (in an MLX environment with CUDA).
-Questions with more than 26 options use the same tournament as eval_vllm_suite (decision_core.tournament).
+Up to 588 options are read in one pass (labels A..Z, AA, AB, ...), as in eval_vllm_suite; more via the tournament
+(decision_core.tournament). TOURNAMENT_26=1 reproduces v1.0/v1.1 (tournament above 26 options).
 usage: [MLX_ITEMS=all|big|small] python eval_mlx_suite.py <mlx_dir> <suite.jsonl> <tag>
        (big = only the questions with more than 26 options; small = only the others; default all)"""
 import collections
@@ -18,10 +19,12 @@ EIKOS_RUNS = os.environ.get("EIKOS_RUNS", "runs")  # evaluation outputs
 M, SUITE, TAG = sys.argv[1:4]
 mx.set_cache_limit(4 * 1024 ** 3)  # without a limit, the MLX (CUDA) cache grows until it fills the whole GPU
 d = MLXDecider(M)
-from decision_core import options_of, tournament  # noqa: E402  (after MLXDecider sets PROMPT_STYLE)
+import decision_core  # noqa: E402  (after MLXDecider sets PROMPT_STYLE and the model's one-pass limit)
+from decision_core import options_of, tournament  # noqa: E402
 
 ITEMS = os.environ.get("MLX_ITEMS", "all")
 assert ITEMS in ("all", "big", "small"), ITEMS
+OLD = dict(chunk=20, keep=2, limit=26) if os.environ.get("TOURNAMENT_26") == "1" else {}  # v1.0/v1.1 readout
 
 BUCKET = 128
 
@@ -49,8 +52,8 @@ with open(f"{EIKOS_RUNS}/suite_{TAG}.jsonl", "w") as fo:
         big = len(o) > 26
         if (ITEMS == "big" and not big) or (ITEMS == "small" and big):
             continue
-        if big:  # blocks of 20, the top 2 of each block go to the final round (<=26), as in eval_vllm_suite
-            p, n = tournament(lambda oo, r=r: dist_bucketed(r["state"], r["question"], oo), o)
+        if big:  # one pass up to 588 options, tournament beyond (or above 26 with TOURNAMENT_26=1)
+            p, n = tournament(lambda oo, r=r: dist_bucketed(r["state"], r["question"], oo), o, **OLD)
         else:
             p, n = dist_bucketed(r["state"], r["question"], o)
         if n > 4000:
@@ -59,7 +62,8 @@ with open(f"{EIKOS_RUNS}/suite_{TAG}.jsonl", "w") as fo:
         ok = pred == str(r["expected"])
         per[r["task"]].append(ok)
         fo.write(json.dumps({"id": r["id"], "task": r["task"], "pred": pred, "gold": r["expected"], "ok": ok,
-                             "conf": p[pred], "n_tok": n, "tournament": big}) + "\n")
+                             "conf": p[pred], "n_tok": n,
+                             "tournament": len(o) > (OLD.get("limit") or decision_core.MAX_ONE_PASS)}) + "\n")
 summ = {t: {"acc": round(sum(v) / len(v), 4), "n": len(v)} for t, v in sorted(per.items())}
 summ["_macro"] = round(sum(x["acc"] for x in summ.values()) / len(summ), 4)
 summ["_tag"] = TAG

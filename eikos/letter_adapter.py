@@ -1,5 +1,6 @@
 """Decision readout from letter logits (one forward pass per decision), used in evaluation (the JevBench harness and
-the evaluation suites) and by the server. Format/prompt come from decision_core (same as in training).
+the evaluation suites) and by the server. Format/prompt come from decision_core (same as in training). Options are
+labelled A..Z, AA, AB, ... (decision_core.LABELS, one token each): up to 588 options are read in one pass.
 
 Modes:
 - local (transformers): model_path = model path/repo (+ optional LoRA adapter);
@@ -13,13 +14,15 @@ import contextlib
 import copy
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
 
-from decision_core import (LETTERS, PROMPT_VERSION, STYLE, SYSTEM, messages, options_of,  # noqa: F401
+import decision_core
+from decision_core import (LABELS, LETTERS, PROMPT_VERSION, STYLE, SYSTEM, messages, options_of,  # noqa: F401
                            render_user, state_text, temp_for, tournament)
 
 import os
@@ -69,43 +72,89 @@ class LetterAdapter:
         self.mix_w = mix_w if mix_w is not None else float(os.environ.get("MIX_W", "0.5"))
         self._jhead = None
         self._loaded = None
+        self._lp_cap = None  # --max-logprobs of the vLLM server, learned from its first refusal (None: not limited)
+        self._inflight, self._rlock = {}, threading.Lock()  # requests in flight per vLLM server
 
     # ---------------- loading ----------------
-    def _sglang(self):  # "sglang:<url>|<tokenizer>" or "vllm:<url>|<tokenizer>"
+    def _sglang(self):  # "sglang:<url>|<tokenizer>" or "vllm:<url>[,<url>...]|<tokenizer>"
         url, tok_path = self.model_path.split(":", 1)[1].split("|", 1)
-        return url.rstrip("/"), tok_path
+        return url.split(",")[0].strip().rstrip("/"), tok_path
+
+    @contextlib.contextmanager
+    def _replica(self):
+        """Several vLLM servers (e.g. one per GPU, comma-separated URLs): each request goes to the one with the fewest
+        requests in flight, and all of its calls stay there (its prefix cache holds the state)."""
+        urls = [u.strip().rstrip("/") for u in self.model_path.split(":", 1)[1].split("|", 1)[0].split(",")]
+        with self._rlock:
+            url = min(urls, key=lambda u: self._inflight.get(u, 0))
+            self._inflight[url] = self._inflight.get(url, 0) + 1
+        try:
+            yield url
+        finally:
+            with self._rlock:
+                self._inflight[url] -= 1
 
     @property
     def _is_vllm(self):
         return self.model_path.startswith("vllm:")
 
-    def _vllm_letters(self, texts, n_max):
-        """One /v1/completions call with all the prompts; allowed letters = A..(n_max); logprobs already normalized
-        over the letters only (server run with --logprobs-mode processed_logprobs). Returns (list of letter_logprobs,
-        n_tok)."""
+    def _vllm_letters(self, texts, n_max, url=None):
+        """One /v1/completions call with all the prompts; allowed labels = the first n_max; logprobs already
+        normalized over the allowed labels (server run with --logprobs-mode processed_logprobs). A server started with
+        a lower --max-logprobs (v1.0 and v1.1 used 32) only returns its top labels: the labels it leaves out share the
+        remaining probability evenly. Returns (list of label_logprobs, n_tok)."""
+        import urllib.error
         import urllib.request
-        url, _ = self._sglang()
+        url = url or self._sglang()[0]
         want = self._loaded[2][:n_max]
-        body = {"model": "decider", "prompt": texts, "max_tokens": 1, "temperature": 0.0, "logprobs": n_max,
-                "allowed_token_ids": want, "return_tokens_as_token_ids": True}
-        req = urllib.request.Request(f"{url}/v1/completions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=900) as r:
-            d = json.loads(r.read())
+        while True:
+            n_lp = n_max if self._lp_cap is None else min(n_max, self._lp_cap)
+            body = {"model": "decider", "prompt": texts, "max_tokens": 1, "temperature": 0.0, "logprobs": n_lp,
+                    "allowed_token_ids": want, "return_tokens_as_token_ids": True}
+            req = urllib.request.Request(f"{url}/v1/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=900) as r:
+                    d = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 400 or n_lp <= 32 or "logprobs" not in e.read().decode(errors="replace"):
+                    raise
+                self._lp_cap = 32  # older server: read the top 32 labels and spread the rest
         out = [None] * len(texts)
         for ch in d["choices"]:
             top = ch["logprobs"]["top_logprobs"][0]
             lp = {int(k.split(":", 1)[1]) if k.startswith("token_id:") else k: v for k, v in top.items()}
+            rest = [i for i in want if i not in lp]
+            if rest:
+                tail = max(1.0 - sum(math.exp(v) for v in lp.values()), 1e-12)
+                lp.update({i: math.log(tail / len(rest)) for i in rest})
             out[ch["index"]] = lp
         n_tok = d.get("usage", {}).get("prompt_tokens", 0) // max(1, len(texts))
         return out, n_tok
 
+    def _warm_prefix(self, texts, url):
+        """vLLM does not share a prefix between the prompts of one call while it is being computed, so N questions about
+        one state would compute that state N times. One short call with their common prefix first puts its full cache
+        blocks in the prefix cache, and the N questions then read them. EIKOS_SHARED_PREFIX=0 turns this off."""
+        if len(texts) < 2 or os.environ.get("EIKOS_SHARED_PREFIX", "1") != "1":
+            return
+        pre = os.path.commonprefix(texts)
+        if len(pre) < int(os.environ.get("EIKOS_SHARED_MIN_CHARS", "3000")):  # less than ~1 cache block: nothing to gain
+            return
+        import urllib.request
+        body = {"model": "decider", "prompt": pre, "max_tokens": 1, "temperature": 0.0}
+        req = urllib.request.Request(f"{url}/v1/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=900) as r:
+            r.read()
+
     @staticmethod
     def _letter_ids(tok):
         ids = []
-        for L in LETTERS:
+        for L in LABELS:
             t = tok.encode(L, add_special_tokens=False)
-            assert len(t) == 1, f"letter {L} is not a single token: {t}"
+            assert len(t) == 1, f"label {L} is not a single token: {t}"
             ids.append(t[0])
         assert len(set(ids)) == len(ids)
         return ids
@@ -197,7 +246,8 @@ class LetterAdapter:
                                                add_generation_prompt=True, enable_thinking=True)
             text = text + thought.split("</think>")[0].rstrip() + "\n</think>\n\n"
         if model is None and self._is_vllm:
-            (lp,), n_tok = self._vllm_letters([text], len(opts))
+            with self._replica() as url:
+                (lp,), n_tok = self._vllm_letters([text], len(opts), url)
             lg = torch.tensor([lp.get(i, -1e9) for i in want])
             return self._probs(lg, n_tok, opts, question), n_tok
         if model is None:
@@ -242,15 +292,17 @@ class LetterAdapter:
         """Parallel: several questions about the same state in a single GPU pass (batch, right-padding).
         items = [(question, opts), ...]. With vLLM or SGLang, all prompts go in one call and the server's prefix cache
         reuses the state. Falls back to the sequential path for the energy readout, verify mode, a single question or
-        >26 options."""
+        more options than one pass reads (decision_core.MAX_ONE_PASS)."""
         model, tok, let_ids = self.load()
         if (self._jhead is not None or self.verify_budget > 0 or len(items) == 1
-                or any(len(o) > len(LETTERS) for _, o in items)):
+                or any(len(o) > decision_core.MAX_ONE_PASS for _, o in items)):
             return [self.dist_any(state, q, o) for q, o in items]
         if model is None and self._is_vllm:  # vLLM: one call; the server's prefix cache reuses the state
             texts = [tok.apply_chat_template(messages(state, q, o), tokenize=False, add_generation_prompt=True,
                                              enable_thinking=False) for q, o in items]
-            lps, n_tok = self._vllm_letters(texts, max(len(o) for _, o in items))
+            with self._replica() as url:
+                self._warm_prefix(texts, url)
+                lps, n_tok = self._vllm_letters(texts, max(len(o) for _, o in items), url)
             return [(self._probs(torch.tensor([lp.get(i, -1e9) for i in let_ids[:len(o)]]), n_tok, o, q), n_tok)
                     for (q, o), lp in zip(items, lps)]
         if model is None:  # SGLang: one call with the list of prompts; the prefix cache processes the state once
@@ -311,7 +363,8 @@ class LetterAdapter:
         and the suffixes of the N questions run together in one batch. Same result as the full prompt."""
         import time as _t
         model, tok, let_ids = self.load()
-        if model is None or self._jhead is not None or self.verify_budget > 0 or any(len(o) > len(LETTERS) for _, o in items):
+        if (model is None or self._jhead is not None or self.verify_budget > 0
+                or any(len(o) > decision_core.MAX_ONE_PASS for _, o in items)):
             return self.dist_many(state, items)
         texts = [tok.apply_chat_template(messages(state, q, o), tokenize=False, add_generation_prompt=True,
                                          enable_thinking=False) for q, o in items]
@@ -355,7 +408,7 @@ class LetterAdapter:
                          "total_ms": round((_t.perf_counter() - t0) * 1000, 1)}
         return out
 
-    def dist_any(self, state, question, opts, chunk=20, keep=2):
+    def dist_any(self, state, question, opts, chunk=None, keep=None):
         return tournament(lambda o: self.dist(state, question, o), opts, chunk, keep)
 
     # ---------------- harness ----------------

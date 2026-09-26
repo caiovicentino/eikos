@@ -2,8 +2,8 @@
 PyTorch backend (letter_adapter), with no LoRA, no API and no internet. The common prefix (system + state) goes
 through the model once; the hybrid cache (attention KV + Gated DeltaNet states) is replicated and the N questions run
 together in one right-padded batch (real positions never see the padding: causal attention and the recurrence only
-look back). Questions with more than 26 options use the same multi-round tournament as the GPU backends
-(decision_core.tournament).
+look back). Options are labelled A..Z, AA, AB, ... (decision_core.LABELS, one token each), so up to 588 options are read
+in one pass; beyond that, the same tournament as the GPU backends (decision_core.tournament).
 usage: python mlx_decide.py <model_dir>        (demo; compares against PyTorch if COMPARE_TORCH=1)"""
 import copy
 import json
@@ -23,18 +23,21 @@ class MLXDecider:
     def __init__(self, path):
         cfg = json.load(open(os.path.join(path, "decision_config.json")))
         os.environ["PROMPT_STYLE"] = cfg["prompt_version"].rsplit("-", 1)[-1]
-        global LETTERS, messages, options_of, temp_for, tournament
-        from decision_core import LETTERS, messages, options_of, temp_for, tournament  # noqa: F401  (after PROMPT_STYLE is set)
+        global LABELS, messages, options_of, temp_for, tournament, dc
+        import decision_core as dc  # after PROMPT_STYLE is set
+        from decision_core import LABELS, messages, options_of, temp_for, tournament  # noqa: F401
+        dc.set_max_one_pass(cfg.get("max_one_pass"))
         cp = os.path.join(path, cfg.get("calib") or "calib.json")
         self.calib = json.load(open(cp)) if os.path.exists(cp) else None
         self.model, self.tok = mlx_load(path)
         lm = self.model.language_model if hasattr(self.model, "language_model") else self.model
         self.inner, self.lm = lm.model, lm
         self.let = []
-        for L in LETTERS:
+        for L in LABELS:
             t = self.tok.encode(L, add_special_tokens=False)
-            assert len(t) == 1, f"letter {L} is not a single token: {t}"
+            assert len(t) == 1, f"label {L} is not a single token: {t}"
             self.let.append(t[0])
+        assert len(set(self.let)) == len(self.let)
         self.let_idx = mx.array(self.let)
 
     def _ids(self, state, q, opts):
@@ -43,7 +46,7 @@ class MLXDecider:
         return self.tok.encode(text, add_special_tokens=False)
 
     def _letter_logits(self, h):
-        """h: (B, d) → logits (B, 26) over the letters only (tied weights: the embedding used as a linear layer)."""
+        """h: (B, d) → logits (B, 588) over the labels only (tied weights: the embedding used as a linear layer)."""
         if getattr(self.lm.args, "tie_word_embeddings", False):
             out = self.inner.embed_tokens.as_linear(h)
         else:
@@ -57,7 +60,7 @@ class MLXDecider:
         return {lab: p[i] for i, (lab, _) in enumerate(opts)}
 
     def dist(self, state, q, opts):
-        if len(opts) > 26:  # only 26 letters: blocks of 20, the top 2 of each block go to a final round
+        if len(opts) > dc.MAX_ONE_PASS:  # more than one pass reads: blocks, the best of each go to a final round
             return tournament(lambda o: self.dist(state, q, o), opts)
         ids = self._ids(state, q, opts)
         cache = self.lm.make_cache()
@@ -78,11 +81,11 @@ class MLXDecider:
 
     def dist_many_cached(self, state, items, chunk=32):
         """Several questions about the same state: the prefix once, then the questions in a batch from the cache.
-        Questions with more than 26 options go through dist (tournament), one at a time."""
-        if any(len(o) > 26 for _, o in items):
-            small = [(q, o) for q, o in items if len(o) <= 26]
+        Questions with more options than one pass reads go through dist (tournament), one at a time."""
+        if any(len(o) > dc.MAX_ONE_PASS for _, o in items):
+            small = [(q, o) for q, o in items if len(o) <= dc.MAX_ONE_PASS]
             done = iter(self.dist_many_cached(state, small, chunk) if small else [])
-            return [self.dist(state, q, o) if len(o) > 26 else next(done) for q, o in items]
+            return [self.dist(state, q, o) if len(o) > dc.MAX_ONE_PASS else next(done) for q, o in items]
         seqs = [self._ids(state, q, o) for q, o in items]
         P = 0
         while all(len(x) > P + 1 for x in seqs) and len({x[P] for x in seqs}) == 1:
