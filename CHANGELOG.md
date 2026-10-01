@@ -1,5 +1,96 @@
 # Changelog
 
+## serve v1.3 (2026-10-01)
+
+### What changes
+
+**Images.** Eikos reads images with the vision encoder of its base model, which our training left untouched (the
+fine-tuning was text only). `serve.py` v1.3 passes them through vLLM's chat endpoint with the same prompt and the same
+one-pass letter readout as text, so every option still gets a calibrated probability and no text is generated.
+
+- **JSON:** add `"images"` to the request, a list of data URIs or base64 strings (or `{"url": ...}` / `{"data": ...}`
+  objects). An `image_data` field is read too.
+- **multipart/form-data:** the JSON in a `request` field and the images as `image` files. This is the form imajev's
+  clients use for TypeSafe's wire format with images.
+- **Images inside the state:** image data URIs anywhere in the `state` (a string, a dict or list value, chat-style
+  `image_url` parts) are taken out in order and replaced with `[image N]`, the way imajev's server reads them.
+- Every question in the request reads the same images, attached before the decision text; with several images, each
+  is labelled `[image N]`. With images and no text state, the evidence is "the attached image(s)".
+- **Limits:** up to 4 images per request (`--max-images`); images above 3840×2160 pixels are scaled down, keeping
+  their aspect ratio (`--max-image-pixels`); files up to 48 MB (`--max-image-mb`) and request bodies up to 64 MB
+  (`--max-body-mb`). Image URLs are refused unless the server starts with `--allow-image-urls`: a server open to others
+  would otherwise fetch any address it is given.
+- **Builds:** the vLLM path of all six GPU builds (27B and 4B, in bf16, FP8 and INT4) has the vision weights; the FP8
+  and INT4 builds keep the vision tower in bf16. The three MLX builds have no vision weights (their conversion kept the
+  text model only), and the local PyTorch path is text only. Sessions stay text only.
+- **vLLM 0.30 quirks handled:** vLLM can answer 500 once to a request whose image it saw in a request it refused (its
+  two image caches drift apart); `serve.py` retries that request once. A vLLM server started with the older scripts
+  (`--max-logprobs 32`, v1.0 and v1.1) reads images like text: the top 32 labels, the rest spread evenly.
+
+**Other changes**
+
+- An option whose description is `null` now shows its own name. v1.2 showed the text "None".
+- When vLLM refuses a request (a prompt longer than the context, an unreadable image), `serve.py` answers 422 with
+  vLLM's own message instead of a bare 500.
+- `serve_vllm.sh` takes `MAX_MODEL_LEN` (default 16384). A 4K screenshot is about 8,300 tokens.
+
+### Unchanged
+
+- **Text prompts:** byte for byte the same as v1.2.1 for every question without a `null` description: 984 of the
+  988 questions of our regression set (the Decision Index compatibility and stress requests); the 4 that differ are
+  the ones with `null` descriptions.
+- **Text answers:** across those 952 regular questions, no answer changed in two runs against v1.2.1. With the same
+  prompts, the probabilities differ only by vLLM's run-to-run noise (mean 0.0001).
+- **No retraining:** the images are read zero-shot.
+
+### Measured (zero-shot, one RTX PRO 6000 per model, vLLM 0.30)
+
+Public sets, used for evaluation only. GUI grounding is asked as "where is the element for this action?": a 3×3 grid
+described in words (no marks), or a labelled 4×4 grid drawn on the screenshot; the answer is the cell holding the
+centre of the element.
+
+| Set | Items | Chance | Eikos-27B-FP8 | Eikos-4B |
+|---|---|---|---|---|
+| MME (yes/no) | 2,374 | 50% | 89.8% · score 2,495.8 | 87.6% · score 2,397.2 |
+| MMStar | 1,493 | 25% | 72.3% | 66.9% |
+| SEED-Bench-2-Plus (charts, maps, web pages) | 2,277 | 25% | 74.5% | 72.5% |
+| ScreenSpot-v2, no marks (3×3) | 1,272 | 11% | 73.7% | 57.5% |
+| ScreenSpot-v2, 4×4 grid drawn | 1,272 | 6% | 60.9% | 53.9% |
+| ScreenSpot-Pro, no marks (3×3), 500 of 1,581 | 500 | 11% | 65.0% | 51.8% |
+
+Calibration (ECE of the top answer) is 0.028–0.095 for the 27B and 0.035–0.099 for the 4B. Both are too confident on
+SEED-Bench-2-Plus (27B: 84% mean confidence for 74.5% accuracy).
+
+**Against the base model.** Same server, prompt and readout, the base model Eikos-27B was trained from
+(Qwen/Qwen3.8-27B, bf16), on 300 items per set. Eikos-27B is better on all six sets and better calibrated on all six:
+
+| Set (300 items each) | Eikos-27B-FP8 | Qwen3.8-27B | only Eikos right / only base right |
+|---|---|---|---|
+| MME | 90.0% | 73.7% | 50 / 1 |
+| MMStar | 70.7% | 65.3% | 33 / 17 |
+| ScreenSpot-Pro, no marks | 65.7% | 59.0% | 35 / 15 |
+| ScreenSpot-v2, no marks | 71.3% | 68.7% | 25 / 17 |
+| SEED-Bench-2-Plus | 74.3% | 73.3% | 12 / 9 |
+| ScreenSpot-v2, 4×4 grid drawn | 60.0% | 59.0% | 26 / 23 |
+
+The text-only decision training carried over to images. This compares both models in this one-pass typed format,
+not the base model at its best with generated answers.
+
+**Every GPU build** on the same 300 items per set (vLLM 0.30, `serve.py` v1.3):
+
+| 300 items per set | Eikos-27B | Eikos-27B-FP8 | Eikos-27B-INT4 | Eikos-4B | Eikos-4B-FP8 | Eikos-4B-INT4 |
+|---|---|---|---|---|---|---|
+| MME (yes/no) | 89.0% | 90.0% | 89.7% | 89.7% | 89.3% | 87.3% |
+| MMStar | 70.7% | 70.7% | 70.7% | 67.0% | 67.3% | 66.7% |
+| SEED-Bench-2-Plus | 74.0% | 74.3% | 73.3% | 73.7% | 74.0% | 71.7% |
+| ScreenSpot-v2, no marks | 70.7% | 71.3% | 69.0% | 55.7% | 56.3% | 55.0% |
+| ScreenSpot-v2, 4×4 grid drawn | 61.0% | 60.0% | 58.7% | 53.3% | 54.3% | 54.0% |
+| ScreenSpot-Pro, no marks | 66.0% | 65.7% | 61.7% | 52.7% | 51.7% | 52.0% |
+| All 1,800 items | 71.9% | 72.0% | 70.5% | 65.3% | 65.5% | 64.4% |
+| Same answer as bf16: all / confident (≥0.9) | — | 97.6% / 100.0% | 94.8% / 100.0% | — | 95.2% / 100.0% | 88.9% / 99.2% |
+
+Answers that differ from bf16 are almost all on items where bf16 itself was below 0.7 confidence (96–100% of them). The largest gap is Eikos-27B-INT4 on ScreenSpot-Pro: 61.7% against 66.0% for bf16.
+
 ## serve v1.2.1 (2026-09-26)
 
 **`serve_vllm.sh` now sets `--max-num-seqs 64`** (change it with the `MAX_NUM_SEQS` environment variable). Without

@@ -37,7 +37,7 @@ The model cards have the full tables, the per-build validation (bf16, FP8, INT4,
 
 | Folder | What it holds |
 |---|---|
-| `eikos/` | Inference library and server:<br>• `decision_core` (prompt, option labels A–Z, AA, AB, …: up to 588 options in one pass, per-model limit in `decision_config.json`; tournament beyond);<br>• `letter_adapter` (letter-logit readout; PyTorch, SGLang and vLLM backends; prefix cache);<br>• `serve.py` (HTTP API + agent sessions);<br>• `mlx_decide.py` (Apple Silicon). |
+| `eikos/` | Inference library and server:<br>• `decision_core` (prompt, option labels A–Z, AA, AB, …: up to 588 options in one pass, per-model limit in `decision_config.json`; tournament beyond);<br>• `letter_adapter` (letter-logit readout; PyTorch, SGLang and vLLM backends; prefix cache);<br>• `serve.py` (HTTP API, images through vLLM, agent sessions);<br>• `mlx_decide.py` (Apple Silicon). |
 | `examples/` | Local demo and a game-loop latency benchmark |
 | `scripts/` | `serve_vllm.sh` (production serving), `train_final.sh` (exact final recipes), `build_eval_suites.sh` |
 | `data_pipeline/` | Item generation with blind teacher labeling (`gen_pipeline.py`), programmatic generators (`prog_*.py`), long-context dossiers, PT↔EN views, decontamination and the training snapshot |
@@ -86,6 +86,12 @@ curl -s localhost:8000/v1/systemone -d '{
 All questions in a request are answered in one pass over the shared state, which the prefix cache processes once.
 The server also supports agent sessions with an incremental state: `POST /v1/sessions`, `.../append`,
 `.../systemone`.
+
+**Images (serve v1.3, vLLM backend):** add `"images"` to the request (data URIs or base64 strings), send
+multipart/form-data with the JSON in a `request` field and the images as `image` files, or put image data URIs inside
+the `state`, where they are taken out and replaced with `[image N]`. Every question reads the same images with the
+same one-pass readout. Zero-shot, Eikos-27B-FP8 gets 89.8% on MME, 72.3% on MMStar and 73.7% on ScreenSpot-v2 (3×3
+grid, no marks); the model cards have the limits and the full results. The MLX builds are text only.
 
 On a Mac:
 

@@ -45,6 +45,21 @@ except ImportError:  # used outside the harness (e.g. the release server)
         label: Optional[str] = None
 
 
+def _refusal(code, body):
+    """A 4xx from the model server (prompt too long, unreadable image, ...) becomes a ValueError, which serve.py answers
+    with 422 and the server's own message; anything else stays an error."""
+    msg = body
+    try:
+        d = json.loads(body)
+        err = d.get("error")
+        msg = (err.get("message") if isinstance(err, dict) else err) or d.get("message") or body
+    except Exception:  # noqa: BLE001
+        pass
+    if 400 <= code < 500:
+        return ValueError(f"the model server refused the request: {str(msg)[:500]}")
+    return RuntimeError(f"model server HTTP {code}: {str(msg)[:300]}")
+
+
 class LetterAdapter:
     name = "ours_letter"
     cost_basis = "self_hosted_gpu"
@@ -118,8 +133,9 @@ class LetterAdapter:
                     d = json.loads(r.read())
                 break
             except urllib.error.HTTPError as e:
-                if e.code != 400 or n_lp <= 32 or "logprobs" not in e.read().decode(errors="replace"):
-                    raise
+                body = e.read().decode(errors="replace")
+                if e.code != 400 or n_lp <= 32 or "logprobs" not in body:
+                    raise _refusal(e.code, body) from None
                 self._lp_cap = 32  # older server: read the top 32 labels and spread the rest
         out = [None] * len(texts)
         for ch in d["choices"]:
@@ -132,6 +148,62 @@ class LetterAdapter:
             out[ch["index"]] = lp
         n_tok = d.get("usage", {}).get("prompt_tokens", 0) // max(1, len(texts))
         return out, n_tok
+
+    def _vllm_chat_letters(self, msgs_list, n_max, url=None):
+        """Image decisions: vLLM's chat endpoint takes images (the completions endpoint does not). Same readout as
+        _vllm_letters: the first n_max labels are the only allowed tokens and their logprobs come normalized over them.
+        The first prompt goes alone, so the image is in the prefix cache before the other questions about it arrive.
+        A server started with a lower --max-logprobs is read as in _vllm_letters (top 32 labels, the rest spread).
+        Returns (list of label_logprobs, list of prompt token counts)."""
+        import urllib.error
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+        url = url or self._sglang()[0]
+        want = self._loaded[2][:n_max]
+
+        def one(msgs):
+            retried = False
+            while True:
+                n_lp = n_max if self._lp_cap is None else min(n_max, self._lp_cap)
+                body = {"model": "decider", "messages": msgs, "max_tokens": 1, "temperature": 0.0, "logprobs": True,
+                        "top_logprobs": n_lp, "allowed_token_ids": want, "return_tokens_as_token_ids": True,
+                        "chat_template_kwargs": {"enable_thinking": False}}
+                req = urllib.request.Request(f"{url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=900) as r:
+                        d = json.loads(r.read())
+                    break
+                except urllib.error.HTTPError as e:
+                    err = e.read().decode(errors="replace")
+                    if e.code >= 500 and not retried:
+                        # vLLM 0.30 answers 500 once when an image from a refused request comes back (its two image
+                        # caches drift apart); the second try sends the image again and works
+                        retried = True
+                        continue
+                    if e.code != 400 or n_lp <= 32 or "logprobs" not in err:
+                        raise _refusal(e.code, err) from None
+                    self._lp_cap = 32  # older server: read the top 32 labels and spread the rest
+            top = d["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+            lp = {int(x["token"].split(":", 1)[1]) if x["token"].startswith("token_id:") else x["token"]: x["logprob"]
+                  for x in top}
+            rest = [i for i in want if i not in lp]
+            if rest:
+                tail = max(1.0 - sum(math.exp(v) for v in lp.values()), 1e-12)
+                lp.update({i: math.log(tail / len(rest)) for i in rest})
+            return lp, d.get("usage", {}).get("prompt_tokens", 0)
+
+        out = [one(msgs_list[0])]
+        if len(msgs_list) > 1:
+            with ThreadPoolExecutor(max_workers=min(16, len(msgs_list) - 1)) as ex:
+                out += list(ex.map(one, msgs_list[1:]))
+        return [x[0] for x in out], [x[1] for x in out]
+
+    def _check_images(self, model):
+        if not (model is None and self._is_vllm):
+            raise ValueError("images need the vLLM backend (serve_vllm.sh + serve.py --vllm-url)")
+        if self.verify_budget > 0 or self._jhead is not None:
+            raise ValueError("images are read with the letter readout only (no verify mode)")
 
     def _warm_prefix(self, texts, url):
         """vLLM does not share a prefix between the prompts of one call while it is being computed, so N questions about
@@ -223,9 +295,15 @@ class LetterAdapter:
         return torch.tensor([lp[i] for i in want]), int(d["meta_info"].get("prompt_tokens", 0))
 
     @torch.no_grad()
-    def dist(self, state, question, opts):
+    def dist(self, state, question, opts, images=None):
         model, tok, let_ids = self.load()
         want = let_ids[:len(opts)]
+        if images:
+            self._check_images(model)
+            with self._replica() as url:
+                (lp,), (n_tok,) = self._vllm_chat_letters([messages(state, question, opts, images=images)], len(opts), url)
+            lg = torch.tensor([lp.get(i, -1e9) for i in want])
+            return self._probs(lg, n_tok, opts, question), n_tok
         verify = self.verify_budget > 0
         text = tok.apply_chat_template(messages(state, question, opts, verify=verify), tokenize=False,
                                        add_generation_prompt=True, enable_thinking=verify)
@@ -288,12 +366,22 @@ class LetterAdapter:
         return {k: v / s for k, v in mix.items()}, int(ids.shape[1])
 
     @torch.no_grad()
-    def dist_many(self, state, items):
+    def dist_many(self, state, items, images=None):
         """Parallel: several questions about the same state in a single GPU pass (batch, right-padding).
         items = [(question, opts), ...]. With vLLM or SGLang, all prompts go in one call and the server's prefix cache
         reuses the state. Falls back to the sequential path for the energy readout, verify mode, a single question or
-        more options than one pass reads (decision_core.MAX_ONE_PASS)."""
+        more options than one pass reads (decision_core.MAX_ONE_PASS). With images (vLLM only), the prompts go through
+        vLLM's chat endpoint, one per question, the first one alone so the image is cached for the rest."""
         model, tok, let_ids = self.load()
+        if images:
+            self._check_images(model)
+            if len(items) == 1 or any(len(o) > decision_core.MAX_ONE_PASS for _, o in items):
+                return [self.dist_any(state, q, o, images=images) for q, o in items]
+            with self._replica() as url:
+                lps, ntoks = self._vllm_chat_letters([messages(state, q, o, images=images) for q, o in items],
+                                                     max(len(o) for _, o in items), url)
+            return [(self._probs(torch.tensor([lp.get(i, -1e9) for i in let_ids[:len(o)]]), n, o, q), n)
+                    for (q, o), lp, n in zip(items, lps, ntoks)]
         if (self._jhead is not None or self.verify_budget > 0 or len(items) == 1
                 or any(len(o) > decision_core.MAX_ONE_PASS for _, o in items)):
             return [self.dist_any(state, q, o) for q, o in items]
@@ -408,8 +496,8 @@ class LetterAdapter:
                          "total_ms": round((_t.perf_counter() - t0) * 1000, 1)}
         return out
 
-    def dist_any(self, state, question, opts, chunk=None, keep=None):
-        return tournament(lambda o: self.dist(state, question, o), opts, chunk, keep)
+    def dist_any(self, state, question, opts, chunk=None, keep=None, images=None):
+        return tournament(lambda o: self.dist(state, question, o, images=images), opts, chunk, keep)
 
     # ---------------- harness ----------------
     def run(self, task) -> DecisionResult:

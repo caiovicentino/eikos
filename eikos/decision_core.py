@@ -49,21 +49,26 @@ def state_text(state) -> str:
     return state if isinstance(state, str) else json.dumps(state, ensure_ascii=False, indent=1)
 
 
+def _desc(value, default: str) -> str:
+    """An option's description; a missing or null one shows the option's own name (v1.2 showed the text "None")."""
+    return default if value is None else str(value)
+
+
 def options_of(question: dict, labels: list | None = None) -> list[tuple[str, str]]:
     """(label, description). With `labels`, follows the item's order; otherwise derives them from the criteria (API)."""
     qtype = question.get("type")
     crit = question.get("criteria")
     if qtype in ("noul", "boolean"):
         crit = crit or {}
-        return [("yes", str(crit.get("true", "yes"))), ("no", str(crit.get("false", "no")))]
+        return [("yes", _desc(crit.get("true"), "yes")), ("no", _desc(crit.get("false"), "no"))]
     if qtype == "score":
         if isinstance(crit, dict):
             keys = [str(l) for l in labels] if labels else list(crit.keys())
-            return [(k, str(crit.get(k, k))) for k in keys]
+            return [(k, _desc(crit.get(k), k)) for k in keys]
         return [(str(i), str(c)) for i, c in enumerate(crit or [])]
     if isinstance(crit, dict):
         keys = list(labels) if labels else list(crit.keys())
-        return [(k, str(crit.get(k, k))) for k in keys]
+        return [(k, _desc(crit.get(k), k)) for k in keys]
     keys = list(labels) if labels else [str(o) for o in (question.get("options") or crit or [])]
     return [(k, k) for k in keys]
 
@@ -81,9 +86,27 @@ def render_user(state, question: dict, opts: list[tuple[str, str]]) -> str:
             f"Options:\n{ol}\n\nAnswer with the letter of the correct option.")
 
 
-def messages(state, question, opts, verify: bool = False) -> list[dict]:
-    return [{"role": "system", "content": VERIFY_SYSTEM if verify else SYSTEM},
-            {"role": "user", "content": render_user(state, question, opts)}]
+def image_evidence(state, n_images: int):
+    """The evidence when images come with no text state: it names the attached image(s)."""
+    if n_images and state in (None, "", {}, []):
+        return "the attached image" if n_images == 1 else f"the {n_images} attached images, in order"
+    return state
+
+
+def messages(state, question, opts, verify: bool = False, images: list | None = None) -> list[dict]:
+    """Chat messages for one decision. With images (data URIs or URLs), the user turn carries them first (labelled
+    "[image N]" when there are several) and then the same decision text; without images it is the text alone, as in
+    training."""
+    system = {"role": "system", "content": VERIFY_SYSTEM if verify else SYSTEM}
+    if not images:
+        return [system, {"role": "user", "content": render_user(state, question, opts)}]
+    parts = []
+    for i, u in enumerate(images, 1):
+        if len(images) > 1:  # several images: each is labelled, as "[image N]" refers to it in the state
+            parts.append({"type": "text", "text": f"[image {i}]"})
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    parts.append({"type": "text", "text": render_user(image_evidence(state, len(images)), question, opts)})
+    return [system, {"role": "user", "content": parts}]
 
 
 def temp_for(calib: dict | None, temp: float, n_tok: int, n_opts: int, qtype: str) -> float:
